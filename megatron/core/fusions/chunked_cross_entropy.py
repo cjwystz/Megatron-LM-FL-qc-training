@@ -91,3 +91,13 @@ class _ChunkedVocabParallelCrossEntropy(torch.autograd.Function):
             grad[i : i + ctx.chunk_size] = lc.to(flat_logits.dtype)
         s, b = ctx.sb_shape
         return grad.view(s, b, -1), None, None, None
+
+def _tp_logsumexp(x: torch.Tensor, dim: int, tp_group) -> torch.Tensor:
+    """Logsumexp with optional TP all-reduce (MAX then SUM), fp32."""
+    if tp_group is None or tp_group.size() == 1:
+        return torch.logsumexp(x, dim=dim)
+    mx = x.max(dim=dim, keepdim=True).values
+    dist.all_reduce(mx, op=dist.ReduceOp.MAX, group=tp_group)
+    sumexp = (x - mx).exp().sum(dim=dim, keepdim=True)
+    dist.all_reduce(sumexp, op=dist.ReduceOp.SUM, group=tp_group)
+    return (mx + sumexp.log()).squeeze(dim)
