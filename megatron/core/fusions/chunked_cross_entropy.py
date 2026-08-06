@@ -101,3 +101,24 @@ def _tp_logsumexp(x: torch.Tensor, dim: int, tp_group) -> torch.Tensor:
     sumexp = (x - mx).exp().sum(dim=dim, keepdim=True)
     dist.all_reduce(sumexp, op=dist.ReduceOp.SUM, group=tp_group)
     return (mx + sumexp.log()).squeeze(dim)
+
+def _tp_softmax(x: torch.Tensor, dim: int, tp_group) -> torch.Tensor:
+    """Softmax with optional TP all-reduce, fp32."""
+    if tp_group is None or tp_group.size() == 1:
+        return torch.softmax(x, dim=dim)
+    mx = x.max(dim=dim, keepdim=True).values
+    dist.all_reduce(mx, op=dist.ReduceOp.MAX, group=tp_group)
+    e = (x - mx).exp()
+    s = e.sum(dim=dim, keepdim=True)
+    dist.all_reduce(s, op=dist.ReduceOp.SUM, group=tp_group)
+    return e / s
+
+def chunked_vocab_parallel_cross_entropy(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    chunk_size: int,
+    tp_group: Optional[dist.ProcessGroup] = None,
+) -> torch.Tensor:
+    """Chunked vocab-parallel cross entropy. Same interface/semantics as
+    ``tensor_parallel.vocab_parallel_cross_entropy`` (per-token loss [s, b])."""
+    return _ChunkedVocabParallelCrossEntropy.apply(logits, labels, chunk_size, tp_group)
