@@ -64,3 +64,30 @@ class _ChunkedVocabParallelCrossEntropy(torch.autograd.Function):
                 loss_chunks.append(lse - pred)
             loss = torch.cat(loss_chunks, dim=0)  # [s*b]
         return loss.view(s, b)
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        flat_logits, flat_labels = ctx.saved_tensors
+        grad = torch.empty_like(flat_logits)  # bf16 [s*b, v]
+        n = flat_logits.size(0)
+        go = grad_output.reshape(n)
+        for i in range(0, n, ctx.chunk_size):
+            lc = flat_logits[i : i + ctx.chunk_size].float()  # 唯一的 fp32 chunk buffer
+            # clamp guards IGNORE_IDX (-100): scatter_add_ with a negative index
+            # is out-of-bounds UB. grad_output is exactly 0 at masked positions
+            # (loss = sum(losses * loss_mask)), so the dummy index is a no-op.
+            tgt = flat_labels[i : i + ctx.chunk_size].long().clamp(min=0).unsqueeze(-1)
+            g = go[i : i + ctx.chunk_size].unsqueeze(-1).to(lc.dtype)
+            # in-place: lc = softmax * g - onehot * g  (d(CE)/dlogits * grad_output)
+            if ctx.tp_group is not None and ctx.tp_group.size() > 1:
+                mx = lc.max(dim=-1, keepdim=True).values
+                dist.all_reduce(mx, op=dist.ReduceOp.MAX, group=ctx.tp_group)
+                lc -= mx
+            lc.exp_()
+            denom = lc.sum(dim=-1, keepdim=True)
+            if ctx.tp_group is not None and ctx.tp_group.size() > 1:
+                dist.all_reduce(denom, op=dist.ReduceOp.SUM, group=ctx.tp_group)
+            lc *= g / denom
+            lc.scatter_add_(-1, tgt, -g)
+            grad[i : i + ctx.chunk_size] = lc.to(flat_logits.dtype)
+        s, b = ctx.sb_shape
+        return grad.view(s, b, -1), None, None, None
