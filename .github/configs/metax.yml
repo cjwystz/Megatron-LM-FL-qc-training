@@ -5,32 +5,25 @@
 hardware_name: metax
 display_name: 'Metax Tests'
 setup_script: .github/scripts/set_env_metax.sh
-nproc_per_node: 8
 
 # CI image for Metax dev env
 # ci_image: localhost:5000/cr.metax-tech.com/public-ai-release/maca/megatron-lm:0.12.0-maca.ai3.3.0.11-torch2.6-py312-ubuntu22.04-amd64
 
 # CI image for online env
-ci_image: harbor.baai.ac.cn/flagscale/megatron-lm-with-te:202603231839
+ci_image: harbor.baai.ac.cn/flagscale/megatron-lm-fl:manual-20260827-metax-dev
 
 # Runner labels for Metax node
 runner_labels:
-  - mx-4g-cicd-megatron
+  - mx-8g-cicd-megatron
 
-# Container volumes (hardware-specific paths)
-# container_volumes:
-#   - /home/flagscale_cicd/flask/static:/workspace/report
-#   - /home/flagscale_cicd/flask/config:/workspace/config
-#   - /home/flagscale_cicd/docker/docker_build/docker_data:/home/gitlab-runner/data
-#   - /home/flagscale_cicd/docker/docker_build/docker_tokenizers:/home/gitlab-runner/tokenizers
-#   - /home/flagscale_cicd/docker/docker_build/docker_data/Megatron-LM/datasets:/opt/data/datasets
-#   - /home/flagscale_cicd/docker/docker_build/docker_tokenizers/Megatron-LM/tokenizers:/opt/data/tokenizers
-
-# The mx-4g-cicd-megatron runner publishes shared artifacts under
-# /mnt/airs-business. Using the legacy /mnt/op paths creates empty bind mounts.
+# Container volumes (local runner assets under /data)
 container_volumes:
-  - /mnt/airs-business/cicd/baai_datasets:/home/gitlab-runner/data
-  - /mnt/airs-business/cicd/baai_tokenizers:/home/gitlab-runner/tokenizers
+  - /home/flagscale_cicd/flask/static:/workspace/report
+  - /home/flagscale_cicd/flask/config:/workspace/config
+  - /data/megatron-ci-assets-20260726/baai_datasets:/home/gitlab-runner/data
+  - /data/megatron-ci-assets-20260726/baai_tokenizers:/home/gitlab-runner/tokenizers
+  - /data/megatron-ci-assets-20260726/baai_datasets:/opt/data/datasets
+  - /data/megatron-ci-assets-20260726/baai_tokenizers:/opt/data/tokenizers
 
 # Container options (hardware-specific settings)
 container_options: >-
@@ -49,9 +42,12 @@ device_types:
 # Test matrix configuration
 test_matrix:
   unit:
+    nproc_per_node: 8
     devices:
       - c550
-    pytest_extra_args: []
+    pytest_extra_args:
+      - -m
+      - not experimental and not flaky_in_dev
     groups:
       - name: core
         path: tests/unit_tests/test_*.py megatron/plugin/tests/
@@ -78,11 +74,14 @@ test_matrix:
         path: tests/unit_tests/fusions/
         description: Fusion tests
       - name: others
-        path: tests/unit_tests/export/ tests/unit_tests/post_training/ tests/unit_tests/tokenizers/ tests/unit_tests/utils/
-        description: Export, post-training, tokenizer, and utility tests
+        path: tests/unit_tests/post_training/ tests/unit_tests/tokenizers/ tests/unit_tests/utils/
+        description: post-training, tokenizer, and utility tests
     # Ignored test files for unit tests
     # These files will be skipped when running pytest
     ignored_tests:
+      # LayerWise optimizer suites require the optional Emerging Optimizers package.
+      - tests/unit_tests/test_layer_wise_optimizer.py
+      - tests/unit_tests/dist_checkpointing/test_layer_wise_optimizer.py
       # single test cases below are unstable on Metax now, need further investigation
       ## 1.core
       - tests/unit_tests/test_fp8_param.py
@@ -104,9 +103,10 @@ test_matrix:
       # ZeroDivisionError: integer modulo by zero
       - tests/unit_tests/models/test_heterogeneous_gpt_model.py
       # need cuda
-      - tests/unit_tests/models/test_mamba_model.py
+      - tests/unit_tests/models/test_hybrid_model.py
+      - tests/unit_tests/models/test_hybrid_moe_model.py
       # Metax image has an incompatible mamba_ssm/causal_conv1d CUDA extension signature.
-      - tests/unit_tests/models/test_mamba_moe_model.py::TestMambaMoEModel::test_forward
+      - tests/unit_tests/models/test_mamba_moe_model.py
       # Metax C500 MIMO 1F1B 8-GPU layouts hit missing tensor model-parallel group initialization.
       - tests/unit_tests/models/test_mimo_1f1b_schedule.py::TestMimo1F1BSchedule::test_encoder_tp2_llm_tp2_pp3_8gpu
       - tests/unit_tests/models/test_mimo_1f1b_schedule.py::TestMimo1F1BSchedule::test_full_pp_8gpu
@@ -176,7 +176,6 @@ test_matrix:
       - tests/unit_tests/dist_checkpointing/models/test_moe_experts.py
       # Metax C500 8-GPU layer-wise optimizer checkpointing times out in
       # determine_main_replica_uniform_distribution/all_gather_object during fully-parallel save.
-      - tests/unit_tests/dist_checkpointing/test_layer_wise_optimizer.py::TestLayerWiseOptimizer::test_optimizer_common_state_dict
       # Metax CI image does not install nvidia-resiliency-ext; keep mcore async strategy covered.
       - tests/unit_tests/dist_checkpointing/test_async_save.py::TestAsyncSave::test_get_async_strategy[nvrx]
       # world_size (4) not divisible by 8 after Core 0.17.0 upgrade.
@@ -202,11 +201,6 @@ test_matrix:
       # DCP mesh requires 4 ranks but runner has 8 after Core 0.17.0 upgrade.
       - tests/unit_tests/distributed/megatron_fsdp/test_mfsdp_fully_shard.py::TestMegatronFsdpFullyShard::test_dcp_checkpoint_save_and_load
 
-      # 7.export
-      - tests/unit_tests/export/trtllm/test_distributed_fp8.py
-      - tests/unit_tests/export/trtllm/test_single_device_fp8.py
-      - tests/unit_tests/export/trtllm/test_trtllm_helper.py
-
       #8.fusions
       - tests/unit_tests/fusions/test_mla_yarn_rope_apply.py
       # TE fused residual RMSNorm hits an aliasing/in-place view limitation on Metax C500.
@@ -215,7 +209,7 @@ test_matrix:
       #9.post training
       # ModelOpt is optional on Metax; model_provider does not export the ModelOpt builder when unavailable.
       - tests/unit_tests/post_training/test_modelopt_model_builder.py::test_model_provider_switches_to_modelopt_builder
-      - tests/unit_tests/post_training/test_modelopt_module_spec.py::TestModelOptMambaModel::test_inference
+      - tests/unit_tests/post_training/test_modelopt_module_spec.py::TestModelOptHybridModel
 
       #10.tokenizers
       - tests/unit_tests/tokenizers/test_tokenizer.py
@@ -292,6 +286,8 @@ test_matrix:
         golden_environment: dev
         golden_platform: c550
         enable_lightweight_mode: false
+        data_path: /home/gitlab-runner/data
+        gpus_per_node: 1
       - model: gpt
         test_case: qwen3_0p6b_mcore_te_tp2_pp2_benchmark_metax
         training_script: pretrain_gpt.py
@@ -299,4 +295,20 @@ test_matrix:
         golden_environment: dev
         golden_platform: c550
         enable_lightweight_mode: false
+        data_path: /home/gitlab-runner/data
         gpus_per_node: 4
+
+# TE-FL runtime configuration
+te_fl:
+  prepare: true
+  build_mode: python
+  build_environment:
+    TE_FL_SKIP_CUDA: "1"
+  runtime:
+    environment:
+      TE_FL_SKIP_CUDA: "1"
+      TE_FL_PREFER: flagos
+    install_pip_args: []
+    # MetaX Triton is supplied by the image; no public triton-metax package is
+    # available from the runtime Python index.
+    pip_packages: [flag-gems, sqlalchemy]

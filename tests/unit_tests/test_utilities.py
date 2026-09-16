@@ -7,6 +7,10 @@ from torch._C._distributed_c10d import PrefixStore
 from torch.distributed import rendezvous
 
 import megatron.core.parallel_state as ps
+from megatron.plugin.platform import get_platform
+
+
+cur_platform = get_platform()
 
 
 class TestModel(torch.nn.Module):
@@ -24,6 +28,13 @@ class TestModel(torch.nn.Module):
         )
         if shared_embedding:
             self.layers[-1].weight.shared_embedding = True
+
+
+def clear_nvte_env_vars():
+    """Clear NVTE env vars set by conftest set_env fixture."""
+    os.environ.pop('NVTE_FLASH_ATTN', None)
+    os.environ.pop('NVTE_FUSED_ATTN', None)
+    os.environ.pop('NVTE_UNFUSED_ATTN', None)
 
 
 class Utils:
@@ -45,24 +56,31 @@ class Utils:
                 f'Initializing torch.distributed with rank: {Utils.rank}, '
                 f'world_size: {Utils.world_size}'
             )
-            torch.cuda.set_device(Utils.rank % torch.cuda.device_count())
+            device_count = cur_platform.device_count()
+            if device_count > 0:
+                cur_platform.set_device(Utils.rank % device_count)
             init_method = 'tcp://'
             master_ip = os.getenv('MASTER_ADDR', 'localhost')
             master_port = os.getenv('MASTER_PORT', '6000')
             init_method += master_ip + ':' + master_port
+            ######## FlagScale Begin ########
+            # Multi-backend CI can spend more than one minute compiling kernels on a rank.
+            # Keep the test store alive long enough for slower ranks to reach group creation.
             rendezvous_iterator = rendezvous(
-                init_method, Utils.rank, Utils.world_size, timeout=timedelta(minutes=1)
+                init_method, Utils.rank, Utils.world_size, timeout=timedelta(minutes=5)
             )
             store, rank, world_size = next(rendezvous_iterator)
-            store.set_timeout(timedelta(minutes=1))
+            store.set_timeout(timedelta(minutes=5))
+            ######## FlagScale End ########
 
             # Use a PrefixStore to avoid accidental overrides of keys used by
             # different systems (e.g. RPC) in case the store is multi-tenant.
             store = PrefixStore("default_pg", store)
             Utils.store = store
 
+            backend = os.getenv('DISTRIBUTED_BACKEND', 'nccl')
             torch.distributed.init_process_group(
-                backend='nccl', world_size=Utils.world_size, rank=Utils.rank, store=store
+                backend=backend, world_size=Utils.world_size, rank=Utils.rank, store=store
             )
 
             torch.distributed.barrier()
@@ -70,7 +88,7 @@ class Utils:
 
     @staticmethod
     def set_world_size(world_size=None, rank=None):
-        Utils.world_size = torch.cuda.device_count() if world_size is None else world_size
+        Utils.world_size = cur_platform.device_count() if world_size is None else world_size
         if (
             torch.distributed.is_initialized()
             and Utils.world_size != torch.distributed.get_world_size()
@@ -93,16 +111,16 @@ class Utils:
             return
 
         try:
-            # Flush pending CUDA work before the barrier so slow ranks don't
+            # Flush pending device work before the barrier so slow ranks don't
             # time out while fast ranks tear down process groups.
-            # NOTE(zhaoyinglia): there is not keyword argument 'timeout' in torch.distributed.barrier()
-            torch.cuda.synchronize()
+            cur_platform.synchronize()
             torch.distributed.barrier()
         except Exception:
             Utils.inited = False
             return
         ps.destroy_model_parallel()
         Utils.inited = False
+        cur_platform.empty_cache()  # FlagScale Modify
 
     @staticmethod
     def initialize_model_parallel(
@@ -119,6 +137,8 @@ class Utils:
 
         ps.destroy_model_parallel()
         Utils.initialize_distributed()
+        if cur_platform.device_name() == 'musa' and 'create_gloo_process_groups' not in kwargs:
+            kwargs['create_gloo_process_groups'] = False
         ps.initialize_model_parallel(
             tensor_model_parallel_size,
             pipeline_model_parallel_size,

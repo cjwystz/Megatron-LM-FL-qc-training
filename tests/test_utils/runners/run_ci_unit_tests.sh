@@ -27,16 +27,27 @@ if ! [[ "$CI_NPROC_PER_NODE" =~ ^[1-9][0-9]*$ ]]; then
   exit 1
 fi
 
-python3 -c \
+PYTHON_BIN="${CI_PYTHON_BIN:-$(command -v python3)}"
+if [ ! -x "$PYTHON_BIN" ]; then
+  echo "::error::python3 executable not found: $PYTHON_BIN"
+  exit 1
+fi
+
+# Optional workflow inputs may be explicitly passed as an empty string.
+export CI_EXPERIMENTAL_PYTEST_EXTRA_ARGS="${CI_EXPERIMENTAL_PYTEST_EXTRA_ARGS:-[]}"
+
+"$PYTHON_BIN" -c \
   "import json, os; value = json.loads(os.environ['CI_IGNORED_TESTS']); assert isinstance(value, list) and all(isinstance(item, str) for item in value)"
-python3 -c \
+"$PYTHON_BIN" -c \
   "import json, os; value = json.loads(os.environ['CI_PYTEST_EXTRA_ARGS']); assert isinstance(value, list) and all(isinstance(item, str) for item in value)"
+"$PYTHON_BIN" -c \
+  "import json, os; value = json.loads(os.environ.get('CI_EXPERIMENTAL_PYTEST_EXTRA_ARGS', '[]')); assert isinstance(value, list) and all(isinstance(item, str) for item in value)"
 
 TEST_PATHS=()
 while IFS= read -r item; do
   [ -n "$item" ] && TEST_PATHS+=("$item")
 done < <(
-  python3 -c '
+  "$PYTHON_BIN" -c '
 import glob
 import json
 import os
@@ -48,34 +59,50 @@ selected = []
 for item in shlex.split(os.environ["CI_TEST_PATH"]):
     matches = sorted(glob.glob(item)) if glob.has_magic(item) else [item]
     selected.extend(path for path in matches if path not in ignored_files)
-print("\n".join(selected))
-'
+print("\n".join(selected), file=os.fdopen(3, "w"))
+' 3>&1 1>&2
 )
 
 IGNORE_OPTS=()
 while IFS= read -r item; do
   [ -n "$item" ] && IGNORE_OPTS+=("$item")
 done < <(
-  python3 -c '
+  "$PYTHON_BIN" -c '
 import json
 import os
 
+output = os.fdopen(3, "w")
 for item in json.loads(os.environ["CI_IGNORED_TESTS"]):
     prefix = "--deselect=" if "::" in item else "--ignore="
-    print(prefix + item)
-'
+    print(prefix + item, file=output)
+' 3>&1 1>&2
 )
 
 EXTRA_ARGS=()
 while IFS= read -r item; do
   [ -n "$item" ] && EXTRA_ARGS+=("$item")
 done < <(
-  python3 -c '
+  "$PYTHON_BIN" -c '
 import json
 import os
 
-print("\n".join(json.loads(os.environ["CI_PYTEST_EXTRA_ARGS"])))
-'
+print("\n".join(json.loads(os.environ["CI_PYTEST_EXTRA_ARGS"])), file=os.fdopen(3, "w"))
+' 3>&1 1>&2
+)
+
+EXPERIMENTAL_ARGS=()
+while IFS= read -r item; do
+  [ -n "$item" ] && EXPERIMENTAL_ARGS+=("$item")
+done < <(
+  "$PYTHON_BIN" -c '
+import json
+import os
+
+print(
+    "\n".join(json.loads(os.environ.get("CI_EXPERIMENTAL_PYTEST_EXTRA_ARGS", "[]"))),
+    file=os.fdopen(3, "w"),
+)
+' 3>&1 1>&2
 )
 
 if [ "${#TEST_PATHS[@]}" -eq 0 ]; then
@@ -83,12 +110,7 @@ if [ "${#TEST_PATHS[@]}" -eq 0 ]; then
   exit 1
 fi
 
-PYTHON_BIN="${CI_PYTHON_BIN:-$(command -v python3)}"
 PYTEST_BIN="${CI_PYTEST_BIN:-$(command -v pytest)}"
-if [ ! -x "$PYTHON_BIN" ]; then
-  echo "::error::python3 executable not found: $PYTHON_BIN"
-  exit 1
-fi
 if [ ! -x "$PYTEST_BIN" ]; then
   echo "::error::pytest executable not found: $PYTEST_BIN"
   exit 1
@@ -128,9 +150,6 @@ PYTEST_ARGS=(
 if [ "${#IGNORE_OPTS[@]}" -gt 0 ]; then
   PYTEST_ARGS+=("${IGNORE_OPTS[@]}")
 fi
-if [ "${#EXTRA_ARGS[@]}" -gt 0 ]; then
-  PYTEST_ARGS+=("${EXTRA_ARGS[@]}")
-fi
 PYTEST_ARGS+=(
   -p
   no:randomly
@@ -138,19 +157,37 @@ PYTEST_ARGS+=(
   addopts="--durations=15 -s -rA"
 )
 
+run_pytest() {
+  "$PYTHON_BIN" -m torch.distributed.run --nproc_per_node="$CI_NPROC_PER_NODE" \
+    --master_port="${MASTER_PORT:-29500}" \
+    -m coverage run \
+    --rcfile="$COVERAGE_DIR/.coveragerc" \
+    "$PYTEST_BIN" \
+    "${PYTEST_ARGS[@]}" \
+    "$@"
+}
+
 set +e
-"$PYTHON_BIN" -m torch.distributed.run --nproc_per_node="$CI_NPROC_PER_NODE" \
-  -m coverage run \
-  --rcfile="$COVERAGE_DIR/.coveragerc" \
-  "$PYTEST_BIN" \
-  "${PYTEST_ARGS[@]}"
-test_exit_code=$?
+run_pytest "${EXTRA_ARGS[@]}"
+normal_exit_code=$?
+
+experimental_exit_code=0
+if [ "${#EXPERIMENTAL_ARGS[@]}" -gt 0 ]; then
+  echo "Running experimental unit tests: $CI_TEST_GROUP"
+  run_pytest "${EXPERIMENTAL_ARGS[@]}"
+  experimental_exit_code=$?
+fi
 set -e
 
-python3 -m coverage combine \
+test_exit_code=$normal_exit_code
+if [ "$test_exit_code" -eq 0 ] && [ "$experimental_exit_code" -ne 0 ]; then
+  test_exit_code=$experimental_exit_code
+fi
+
+"$PYTHON_BIN" -m coverage combine \
   --rcfile="$COVERAGE_DIR/.coveragerc" \
   "$COVERAGE_DIR" 2>/dev/null || true
-python3 -m coverage json \
+"$PYTHON_BIN" -m coverage json \
   --rcfile="$COVERAGE_DIR/.coveragerc" \
   --show-contexts \
   -o "$COVERAGE_JSON" \

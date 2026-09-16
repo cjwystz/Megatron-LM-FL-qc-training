@@ -242,6 +242,22 @@ class ModelParallelConfig:
        from Transformer Engine library is used. Defaults to 'native'.
     """
 
+    chunked_cross_entropy: bool = False
+    """If True, compute vocab parallel cross entropy in chunks along the sequence
+       dimension to reduce peak memory usage. Each chunk is converted to fp32,
+       used, and freed before the next chunk is processed. The backward pass
+       recomputes the softmax per chunk (activation recompute style) instead of
+       storing the full fp32 softmax from the forward pass.
+       Cannot be used together with cross_entropy_loss_fusion.
+       Defaults to False.
+    """
+
+    cross_entropy_chunk_size: int = 4096
+    """Number of sequence positions processed per chunk when chunked_cross_entropy
+       is enabled. Smaller values reduce peak memory further at the cost of more
+       all-reduce calls. Defaults to 4096.
+    """
+
     tp_comm_overlap_disable_qkv: bool = False
     """
        If true, the AllGather -> Gemm overlap for QKV gets disabled
@@ -262,6 +278,11 @@ class ModelParallelConfig:
 
     delay_wgrad_compute: bool = False
     """Delay the weight gradient computation to improve batch-level communication overlapping"""
+
+    overlap_dispatch_backward_with_experts_wgrad: bool = False
+    """Delay TE Grouped GEMM MoE expert weight-gradient computation so it can overlap EP A2A.
+    The deferred expert gradients must complete before their FSDP reduce-scatter.
+    """
 
     ep_overlap_early_attn_memory_release: bool = False
     """Enable early memory release of attention activations during EP overlap.
@@ -400,7 +421,7 @@ class ModelParallelConfig:
        the user adds a level 1 timer that is not called by all ranks.
     """
 
-    # FlagScale Begin
+    ######## FlagScale Begin ########
     ###################
     # Heterogeneous Training
     ###################
@@ -409,7 +430,7 @@ class ModelParallelConfig:
 
     hetero_pipeline_layer_split: list = None
     """A list of lists, each sublist contains numbers of layers to be processed in the corresponding pipeline stages for one device type."""
-    # FlagScale End
+    ######## FlagScale End ########
 
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
@@ -431,6 +452,15 @@ class ModelParallelConfig:
 
         if self.autocast_dtype is None:
             self.autocast_dtype = self.params_dtype
+
+        if self.cross_entropy_loss_fusion and self.cross_entropy_fusion_impl == 'te':
+            warnings.warn(
+                "Transformer Engine cross entropy loss fusion has known stability issues. "
+                "Megatron-LM training args validation rejects this combination by default. "
+                "Use cross_entropy_fusion_impl='native', or disable cross_entropy_loss_fusion.",
+                UserWarning,
+                stacklevel=2,
+            )
 
         if self.defer_embedding_wgrad_compute and self.pipeline_model_parallel_size == 1:
             raise ValueError(
