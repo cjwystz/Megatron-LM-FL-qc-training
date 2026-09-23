@@ -25,6 +25,7 @@ def enable_jit_fuser():
             # routes through the inductor, whose autotuner needs a platform
             # triton backend (triton.backends.mtgpu for MUSA) that isn't
             # guaranteed importable — keep the plain eager functions.
+            
             if get_platform().device_name() == "cuda" and not _is_metax_torch():
                 jit_fuser = torch.compile
             else:
